@@ -1,0 +1,6 @@
+{
+  "query": "Chocolate",
+  "startUrl": "https://www.zepto.com/search?query=Chocolate",
+  "results_wanted": 20,
+  "max_pages": 5
+}

@@ -1,0 +1,219 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "search_query": {
+      "title": "Search Query",
+      "type": "string",
+      "description": "Query used for the search"
+    },
+    "page_number": {
+      "title": "Page Number",
+      "type": "integer",
+      "description": "Page index returned by Zepto"
+    },
+    "store_product_id": {
+      "title": "Store Product ID",
+      "type": "string",
+      "description": "Store product identifier"
+    },
+    "product_id": {
+      "title": "Product ID",
+      "type": "string",
+      "description": "Product identifier"
+    },
+    "product_variant_id": {
+      "title": "Product Variant ID",
+      "type": "string",
+      "description": "Product variant identifier"
+    },
+    "store_id": {
+      "title": "Store ID",
+      "type": "string",
+      "description": "Store identifier"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string",
+      "description": "Product name"
+    },
+    "brand": {
+      "title": "Brand",
+      "type": "string",
+      "description": "Brand name"
+    },
+    "formatted_packsize": {
+      "title": "Pack Size",
+      "type": "string",
+      "description": "Formatted pack size"
+    },
+    "unit_of_measure": {
+      "title": "Unit Of Measure",
+      "type": "string",
+      "description": "Unit of measure"
+    },
+    "available_quantity": {
+      "title": "Available Quantity",
+      "type": "integer",
+      "description": "Available quantity"
+    },
+    "out_of_stock": {
+      "title": "Out Of Stock",
+      "type": "boolean",
+      "description": "Whether the item is out of stock"
+    },
+    "mrp": {
+      "title": "MRP",
+      "type": "number",
+      "description": "Maximum retail price in INR"
+    },
+    "selling_price": {
+      "title": "Selling Price",
+      "type": "number",
+      "description": "Selling price in INR"
+    },
+    "discounted_selling_price": {
+      "title": "Discounted Selling Price",
+      "type": "number",
+      "description": "Discounted selling price in INR"
+    },
+    "discount_percent": {
+      "title": "Discount Percent",
+      "type": "number",
+      "description": "Discount percentage"
+    },
+    "rating_average": {
+      "title": "Rating Average",
+      "type": "number",
+      "description": "Average rating"
+    },
+    "rating_count": {
+      "title": "Rating Count",
+      "type": "integer",
+      "description": "Total ratings"
+    },
+    "image_url": {
+      "title": "Image URL",
+      "type": "string",
+      "description": "Primary product image URL"
+    },
+    "scraped_at": {
+      "title": "Scraped At",
+      "type": "string",
+      "description": "ISO timestamp of scrape time"
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "search_query",
+          "page_number",
+          "name",
+          "brand",
+          "formatted_packsize",
+          "unit_of_measure",
+          "available_quantity",
+          "out_of_stock",
+          "mrp",
+          "selling_price",
+          "discounted_selling_price",
+          "discount_percent",
+          "rating_average",
+          "rating_count",
+          "image_url",
+          "store_product_id",
+          "product_id",
+          "product_variant_id",
+          "store_id",
+          "scraped_at"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "search_query": {
+            "label": "Query",
+            "format": "text"
+          },
+          "page_number": {
+            "label": "Page",
+            "format": "number"
+          },
+          "name": {
+            "label": "Name",
+            "format": "text"
+          },
+          "brand": {
+            "label": "Brand",
+            "format": "text"
+          },
+          "formatted_packsize": {
+            "label": "Pack Size",
+            "format": "text"
+          },
+          "unit_of_measure": {
+            "label": "Unit",
+            "format": "text"
+          },
+          "available_quantity": {
+            "label": "Available Qty",
+            "format": "number"
+          },
+          "out_of_stock": {
+            "label": "Out Of Stock",
+            "format": "text"
+          },
+          "mrp": {
+            "label": "MRP",
+            "format": "currency"
+          },
+          "selling_price": {
+            "label": "Selling Price",
+            "format": "currency"
+          },
+          "discounted_selling_price": {
+            "label": "Discounted Price",
+            "format": "currency"
+          },
+          "discount_percent": {
+            "label": "Discount %",
+            "format": "number"
+          },
+          "rating_average": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "rating_count": {
+            "label": "Ratings",
+            "format": "number"
+          },
+          "image_url": {
+            "label": "Image",
+            "format": "image"
+          },
+          "store_product_id": {
+            "label": "Store Product ID",
+            "format": "text"
+          },
+          "product_id": {
+            "label": "Product ID",
+            "format": "text"
+          },
+          "product_variant_id": {
+            "label": "Variant ID",
+            "format": "text"
+          },
+          "store_id": {
+            "label": "Store ID",
+            "format": "text"
+          },
+          "scraped_at": {
+            "label": "Scraped At",
+            "format": "date"
+          }
+        }
+      }
+    }
+  }
+}
