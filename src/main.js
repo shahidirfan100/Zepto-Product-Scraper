@@ -100,6 +100,129 @@ const extractProductItems = (payload) => {
     return items;
 };
 
+const toRupees = (value) => {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return undefined;
+    return Number((amount / 100).toFixed(2));
+};
+
+const buildImageUrl = (imagePath) => {
+    if (typeof imagePath !== 'string' || !imagePath.trim()) return undefined;
+    if (/^https?:\/\//i.test(imagePath)) return imagePath;
+    return `https://cdn.zeptonow.com/production/${imagePath.replace(/^\/+/, '')}`;
+};
+
+const normalizeTextList = (value) => {
+    if (Array.isArray(value)) {
+        const items = value
+            .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+            .filter(Boolean);
+        return items.length > 0 ? items.join(' | ') : undefined;
+    }
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    return undefined;
+};
+
+const extractAttributeTags = (item) => {
+    const tags = item?.productCardTags?.slot3;
+    if (!Array.isArray(tags)) return undefined;
+
+    const values = [...new Set(tags
+        .filter((tag) => tag?.tagType === 'ATTRIBUTE' && typeof tag?.tagName === 'string')
+        .map((tag) => tag.tagName.trim())
+        .filter(Boolean))];
+
+    return values.length > 0 ? values : undefined;
+};
+
+const cleanFlatRecord = (record) => {
+    const cleaned = {};
+
+    for (const [key, value] of Object.entries(record)) {
+        if (value === null || value === undefined) continue;
+
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) continue;
+            cleaned[key] = trimmed;
+            continue;
+        }
+
+        if (typeof value === 'number') {
+            if (!Number.isFinite(value)) continue;
+            cleaned[key] = value;
+            continue;
+        }
+
+        if (typeof value === 'boolean') {
+            cleaned[key] = value;
+            continue;
+        }
+
+        if (Array.isArray(value)) {
+            const normalized = value
+                .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+                .filter(Boolean);
+            if (normalized.length > 0) cleaned[key] = normalized;
+        }
+    }
+
+    return cleaned;
+};
+
+const mapProductItem = ({ item, searchQuery, pageNumber }) => {
+    const product = item?.product || {};
+    const variant = item?.productVariant || {};
+    const ratingSummary = variant?.ratingSummary || {};
+
+    const mapped = {
+        search_query: searchQuery,
+        page_number: pageNumber,
+        store_product_id: item?.objectId || item?.id,
+        product_id: product?.id || variant?.productId,
+        product_variant_id: variant?.id,
+        store_id: item?.storeId,
+        name: product?.name,
+        brand: product?.brand,
+        country_of_origin: product?.countryOfOrigin,
+        manufacturer_name: product?.manufacturerName,
+        primary_category_name: item?.primaryCategoryName,
+        primary_category_id: item?.primaryCategoryId,
+        primary_subcategory_id: product?.primarySubcategory || item?.primarySubcategoryId,
+        primary_subcategory_name: item?.primarySubcategoryName,
+        formatted_packsize: variant?.formattedPacksize,
+        packsize: variant?.packsize,
+        unit_of_measure: variant?.unitOfMeasure,
+        available_quantity: item?.availableQuantity,
+        catalog_quantity: item?.quantity,
+        max_allowed_quantity: variant?.maxAllowedQuantity,
+        out_of_stock: item?.outOfStock,
+        is_active: item?.isActive,
+        is_best_offer: item?.isBestOffer,
+        is_new_product: item?.isNewProduct,
+        mrp: toRupees(item?.mrp),
+        selling_price: toRupees(item?.sellingPrice),
+        discounted_selling_price: toRupees(item?.discountedSellingPrice),
+        discount_amount: toRupees(item?.discountAmount),
+        discount_percent: item?.discountPercent,
+        super_saver_selling_price: toRupees(item?.superSaverSellingPrice),
+        zepto_pass_price: toRupees(item?.zeptoPassPrice),
+        rating_average: ratingSummary?.averageRating,
+        rating_count: ratingSummary?.totalRatings,
+        image_url: buildImageUrl(variant?.images?.[0]?.path),
+        fssai_license: variant?.fssaiLicense,
+        shelf_life_hours: parsePositiveInt(variant?.shelfLifeInHours, undefined),
+        weight_in_gms: variant?.weightInGms,
+        product_type: item?.productType,
+        description: normalizeTextList(product?.description),
+        how_to_use: normalizeTextList(product?.howToUse),
+        attribute_tags: extractAttributeTags(item),
+        scraped_at: new Date().toISOString(),
+    };
+
+    return cleanFlatRecord(mapped);
+};
+
 const fetchApiPage = async ({ headers, pageNumber, query, userSessionId, proxyConfiguration }) => {
     const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
 
@@ -259,7 +382,7 @@ try {
     let totalSaved = 0;
     let pagesProcessed = 0;
 
-    const pushPageProducts = async (payload) => {
+    const pushPageProducts = async ({ payload, pageNumber }) => {
         const products = extractProductItems(payload);
         const output = [];
 
@@ -267,8 +390,11 @@ try {
             const uniqueId = item?.id || item?.objectId || item?.productVariant?.id || item?.product?.id;
             if (!uniqueId || seenIds.has(uniqueId)) continue;
 
+            const mappedItem = mapProductItem({ item, searchQuery, pageNumber });
+            if (Object.keys(mappedItem).length === 0) continue;
+
             seenIds.add(uniqueId);
-            output.push(item);
+            output.push(mappedItem);
 
             if (totalSaved + output.length >= resultsWanted) break;
         }
@@ -282,7 +408,7 @@ try {
     };
 
     const firstPageNumber = Number(initialCapture.requestBody?.pageNumber) || 0;
-    await pushPageProducts(initialCapture.responseBody);
+    await pushPageProducts({ payload: initialCapture.responseBody, pageNumber: firstPageNumber });
     pagesProcessed++;
 
     log.info(`Saved ${totalSaved} product(s) from page ${firstPageNumber}.`);
@@ -300,7 +426,7 @@ try {
             proxyConfiguration: proxyConf,
         });
 
-        const savedNow = await pushPageProducts(pagePayload);
+        const savedNow = await pushPageProducts({ payload: pagePayload, pageNumber: nextPage });
         pagesProcessed++;
         hasReachedEnd = Boolean(pagePayload?.hasReachedEnd);
 

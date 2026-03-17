@@ -1,75 +1,35 @@
-# API Discovery - Zepto Product Scraper
-
-## Existing Actor Audit (Before Upgrade)
-
-Previous actor state (Remote.co jobs scraper) extracted only job-centric fields:
-- `title`
-- `company`
-- `category`
-- `location`
-- `date_posted`
-- `description_html`
-- `description_text`
-- `url`
-
-This did not match Zepto product search use cases.
-
-## Missing Fields Needed for Zepto
-
-For product intelligence use cases, these were missing:
-- Product IDs and variant IDs
-- Brand and category IDs
-- Pack size and unit of measure
-- Availability / out-of-stock flags
-- MRP, selling price, discounted price, discount percentage
-- Rating average and rating count
-- Image URLs
-- Store ID and query context
-
-## URLScan + Live Network Discovery
-
-Primary discovery sources:
-- URLScan domain search for `zepto.com`
-- Live browser network capture on `https://www.zepto.com/search?query=Chocolate`
-
-Discovered endpoints:
-- `GET https://www.zepto.com/search?_rsc=...` (RSC payload)
-- `POST https://bff-gateway.zepto.com/user-search-service/api/v3/search`
-- `POST https://bff-gateway.zepto.com/user-search-service/api/v3/search/filters`
-
 ## Selected API
+- Endpoint: https://bff-gateway.zepto.com/user-search-service/api/v3/search
+- Method: POST
+- Auth: No explicit auth token required; request relies on captured browser session headers and userSessionId
+- Pagination: `pageNumber` request body parameter
+- Query parameters/body: `query`, `pageNumber`, `mode`, `userSessionId`
+- Response format: JSON
 
-- Endpoint: `https://bff-gateway.zepto.com/user-search-service/api/v3/search`
-- Method: `POST`
-- Auth: Session headers required (captured from live browser session)
-- Pagination: `pageNumber` in request body + `hasReachedEnd` in response
-- Request body shape:
-  - `query` (string)
-  - `pageNumber` (integer)
-  - `mode` (`SHOW_ALL_RESULTS`)
-  - `userSessionId` (string)
+## Selection Notes
+- Returns JSON directly: Yes
+- Field richness: High (nested product + variant + pricing + category + ratings + media fields)
+- Pagination support: Yes (`pageNumber` + `hasReachedEnd`)
+- Score summary (per apify-updater rubric): 80+
 
-### Field Availability
+## Fields Available (API)
+- Product identity: `id`, `objectId`, `product.id`, `productVariant.id`, `storeId`
+- Product details: `product.name`, `product.brand`, `product.countryOfOrigin`, `product.description`, `product.manufacturerName`
+- Category data: `primaryCategoryName`, `primaryCategoryId`, `product.primarySubcategory`
+- Variant data: `productVariant.formattedPacksize`, `productVariant.packsize`, `productVariant.unitOfMeasure`, `productVariant.weightInGms`
+- Price and discount: `mrp`, `sellingPrice`, `discountedSellingPrice`, `discountAmount`, `discountPercent`, `superSaverSellingPrice`, `zeptoPassPrice`
+- Availability: `availableQuantity`, `quantity`, `outOfStock`, `isActive`, `isBestOffer`, `isNewProduct`
+- Ratings: `productVariant.ratingSummary.averageRating`, `productVariant.ratingSummary.totalRatings`
+- Media and labels: `productVariant.images[]`, `productCardTags`
 
-Top-level response fields include:
-- `layout`, `currentPage`, `pageProductCount`, `totalProductCount`, `hasReachedEnd`, `filters`, `pageMeta`, etc.
+## Current Output Strategy (Flat + Clean)
+- Keep only flat scalar fields and small scalar arrays (e.g., `attribute_tags`)
+- Remove null/undefined/empty-string values
+- Convert paise values to INR rupees
+- Keep deterministic deduplication by product/store-level id
+- Include run metadata: `search_query`, `page_number`, `scraped_at`
 
-Product-level fields include (non-exhaustive):
-- `id`, `objectId`, `storeId`
-- `product.*` (name, brand, brandId, primarySubcategory, etc.)
-- `productVariant.*` (id, formattedPacksize, images, mrp, ratingSummary, unitOfMeasure, quantity)
-- Price and discount fields (`mrp`, `sellingPrice`, `discountedSellingPrice`, `discountPercent`, `discountAmount`)
-- Availability fields (`availableQuantity`, `outOfStock`)
-
-## Scoring
-
-| Score Factor | Points |
-|---|---:|
-| Returns JSON directly | +30 |
-| Has >15 unique fields | +25 |
-| No login required for public search | +20 |
-| Supports pagination | +15 |
-| Extends previous fields substantially | +10 |
-| **Total** | **100** |
-
-Selected endpoint exceeds the minimum score (50) and is the richest source for production extraction.
+## Fields Previously Missing / Unclean in Output
+- Previous dataset rows stored full nested raw payload objects
+- Null-heavy nested objects and label blobs increased noise
+- Output now targets consistent flat records with meaningful business values only
