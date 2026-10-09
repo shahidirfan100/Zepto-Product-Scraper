@@ -9,9 +9,11 @@ const IMPIT_BROWSER = 'chrome';
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
 const MAX_PAGE_ATTEMPTS = 3;
 const MAX_SESSION_REFRESHES = 2;
-const CAPTURE_WAIT_ATTEMPTS = 40;
-const CAPTURE_POLL_MS = 500;
-const NAVIGATION_TIMEOUT_MS = 45000;
+const CAPTURE_WAIT_MS = 15000;
+const CAPTURE_POLL_MS = 250;
+const WARMUP_URL = 'https://www.zepto.com/';
+const WARMUP_WAIT_MS = 3000;
+const NAVIGATION_TIMEOUT_MS = 30000;
 
 const sleep = (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -245,8 +247,7 @@ const captureSession = async ({ searchUrl, proxyUrl }) => {
     });
 
     try {
-        const context = await browser.newContext();
-        const page = await context.newPage();
+        const page = await browser.newPage();
         const captures = [];
 
         await page.route('**/*', (route) => {
@@ -294,8 +295,6 @@ const captureSession = async ({ searchUrl, proxyUrl }) => {
             }
         });
 
-        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-
         const hasProducts = (entry) => extractProductItems(entry?.responseBody).length > 0;
         const selectCapture = () => {
             const pageZero = captures.filter((entry) => Number(entry?.requestBody?.pageNumber) === 0);
@@ -305,8 +304,13 @@ const captureSession = async ({ searchUrl, proxyUrl }) => {
                 || captures[0];
         };
 
+        await page.goto(WARMUP_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+        await page.waitForTimeout(WARMUP_WAIT_MS);
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+
         let capture = selectCapture();
-        for (let i = 0; i < CAPTURE_WAIT_ATTEMPTS && !hasProducts(capture); i++) {
+        const deadline = Date.now() + CAPTURE_WAIT_MS;
+        while (Date.now() < deadline && !hasProducts(capture)) {
             await page.waitForTimeout(CAPTURE_POLL_MS);
             capture = selectCapture();
         }
@@ -337,19 +341,18 @@ const captureSession = async ({ searchUrl, proxyUrl }) => {
 const captureSessionWithRetry = async ({ searchUrl, proxyUrl }) => {
     let lastError;
 
-    for (let attempt = 1; attempt <= MAX_PAGE_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
         try {
             const session = await captureSession({ searchUrl, proxyUrl });
-            if (session.firstPageProductCount === 0 && attempt < MAX_PAGE_ATTEMPTS) {
-                log.warning(`Captured page 0 returned no products (attempt ${attempt}/${MAX_PAGE_ATTEMPTS}); retrying session setup.`);
-                await sleep(backoffDelay(attempt));
+            if (session.firstPageProductCount === 0 && attempt < 2) {
+                log.warning('Captured page 0 returned no products; retrying session setup once.');
                 continue;
             }
             return session;
         } catch (error) {
             lastError = error;
-            log.warning(`Session setup failed (attempt ${attempt}/${MAX_PAGE_ATTEMPTS}): ${error.message}`);
-            if (attempt < MAX_PAGE_ATTEMPTS) await sleep(backoffDelay(attempt));
+            log.warning(`Session setup failed (attempt ${attempt}/2): ${error.message}`);
+            if (attempt < 2) await sleep(backoffDelay(attempt, 500));
         }
     }
 
@@ -474,17 +477,15 @@ try {
     log.info(`Search session ready for "${searchQuery}" (page 0: ${session.firstPageProductCount} product(s)).`);
 
     const seenIds = new Set();
-    const collectedRecords = [];
+    let totalSaved = 0;
     let pagesProcessed = 0;
     let stopReason = 'completed';
 
-    const collectPage = ({ payload, pageNumber }) => {
+    const emitPage = async ({ payload, pageNumber }) => {
         const products = extractProductItems(payload);
-        let collected = 0;
+        const output = [];
 
         for (const item of products) {
-            if (collectedRecords.length >= resultsWanted) break;
-
             const uniqueId = item?.id || item?.objectId || item?.productVariant?.id || item?.product?.id;
             if (!uniqueId || seenIds.has(uniqueId)) continue;
 
@@ -492,24 +493,27 @@ try {
             if (Object.keys(mappedItem).length === 0) continue;
 
             seenIds.add(uniqueId);
-            collectedRecords.push(mappedItem);
-            collected++;
+            output.push(mappedItem);
+
+            if (totalSaved + output.length >= resultsWanted) break;
         }
 
-        if (collected > 0) {
-            log.info(`Collected ${collected} product(s) from page ${pageNumber}. Total: ${collectedRecords.length}/${resultsWanted}.`);
+        if (output.length > 0) {
+            await Actor.pushData(output);
+            totalSaved += output.length;
+            log.info(`Saved ${output.length} product(s) from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}.`);
         }
 
-        return collected;
+        return output.length;
     };
 
-    collectPage({ payload: session.firstPagePayload, pageNumber: session.firstPageNumber });
+    await emitPage({ payload: session.firstPagePayload, pageNumber: session.firstPageNumber });
     pagesProcessed++;
 
     let nextPage = session.firstPageNumber + 1;
     let hasReachedEnd = Boolean(session.firstPagePayload?.hasReachedEnd);
 
-    while (collectedRecords.length < resultsWanted && pagesProcessed < maxPages && !hasReachedEnd) {
+    while (totalSaved < resultsWanted && pagesProcessed < maxPages && !hasReachedEnd) {
         const result = await fetchPageWithRecovery({
             client,
             query: searchQuery,
@@ -527,21 +531,19 @@ try {
             break;
         }
 
-        const collectedNow = collectPage({ payload: pagePayload, pageNumber: nextPage });
+        const savedNow = await emitPage({ payload: pagePayload, pageNumber: nextPage });
         pagesProcessed++;
         hasReachedEnd = Boolean(pagePayload?.hasReachedEnd);
 
-        if (collectedNow === 0 && hasReachedEnd) break;
+        if (savedNow === 0 && hasReachedEnd) break;
         nextPage++;
     }
 
-    if (collectedRecords.length === 0) {
+    if (totalSaved === 0) {
         throw new Error('Run completed but no products were extracted.');
     }
 
-    await Actor.pushData(collectedRecords);
-    log.info(`Flushed ${collectedRecords.length} product(s) to the dataset.`);
-    log.info(`Done | query="${searchQuery}" | saved=${collectedRecords.length} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
+    log.info(`Done | query="${searchQuery}" | saved=${totalSaved} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
 } catch (error) {
     exitCode = 1;
     const safeMessage = String(error?.message || 'Unknown error').replace(/https?:\/\/\S+/gi, '[redacted]');

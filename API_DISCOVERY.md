@@ -17,6 +17,11 @@
 2. The actor captures the live search XHR: request headers (including `cookie`, `request-signature`, CSRF headers), the request body (`userSessionId`), and the page-0 JSON payload.
 3. The browser is closed. A single **impit** client (HTTP-only) replays page 1..N using the captured headers/session. The page-0 payload is used directly.
 
+## Guest Session Warm-up (required for speed)
+- Before the browser's guest session is authenticated, the search API answers `HTTP 299` with `{"error_code":"LOGIN_REQUIRED","message":"Oops! Please login to continue searching"}`. That response has no products.
+- A short warm-up navigation to the storefront (`https://www.zepto.com/`) followed by a ~3s pause lets the guest session complete, so the **first** search navigation returns `HTTP 200` with products.
+- Without the warm-up, the first browser instance can stay stuck on `LOGIN_REQUIRED` indefinitely and only a freshly launched browser returns `200` (this was the cause of slow ~50s runs). The warm-up removes that wasted retry cycle.
+
 ## Impit Conversion Findings
 - AWS WAF blocks plain HTTP requests with `HTTP 202` + `x-amzn-waf-action: challenge`, regardless of the impit browser profile. A browser bootstrap is therefore required before impit can fetch data.
 - With the full captured header set + session cookie, impit returns `HTTP 200` JSON.
