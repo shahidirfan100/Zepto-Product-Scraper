@@ -5,20 +5,18 @@
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
-      "title": "Start URL",
-      "type": "string",
-      "description": "Optional Zepto search URL. If provided, the query parameter is synced with Search query.",
-      "editor": "textfield",
-      "prefill": "https://www.zepto.com/search?query=Chocolate",
-      "default": "https://www.zepto.com/search?query=Chocolate"
-    },
+        "title": "Search URL",
+        "type": "string",
+        "description": "Optional Zepto search URL. Its query parameter is used when Search query is empty.",
+        "editor": "textfield",
+        "prefill": "https://www.zepto.com/search?query=Chocolate",
+        "default": "https://www.zepto.com/search?query=Chocolate"
+      },
     "query": {
       "title": "Search query",
       "type": "string",
-      "description": "Search keyword to scrape from Zepto.",
-      "editor": "textfield",
-      "prefill": "Chocolate",
-      "default": "Chocolate"
+      "description": "Search keyword to scrape from Zepto. Takes precedence over Search URL when supplied.",
+      "editor": "textfield"
     },
     "results_wanted": {
       "title": "Maximum number of products",
@@ -26,17 +24,15 @@
       "description": "Maximum number of products to save.",
       "minimum": 1,
       "editor": "number",
-      "default": 20,
-      "prefill": 20
+      "default": 20
     },
     "max_pages": {
       "title": "Maximum pages",
       "type": "integer",
-      "description": "Safety cap for API pages to fetch.",
+      "description": "Safety cap for search pages to fetch.",
       "minimum": 1,
       "editor": "number",
-      "default": 5,
-      "prefill": 5
+      "default": 5
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",

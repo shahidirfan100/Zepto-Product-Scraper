@@ -1,13 +1,29 @@
 import { Actor, log } from 'apify';
-import { Dataset, PlaywrightCrawler } from 'crawlee';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 import { firefox } from 'playwright';
-import { readFile } from 'node:fs/promises';
-
-await Actor.init();
 
 const API_ENDPOINT = 'https://bff-gateway.zepto.com/user-search-service/api/v3/search';
+const SEARCH_API_MATCH = '/user-search-service/api/v3/search';
+const DEFAULT_SEARCH_URL = 'https://www.zepto.com/search?query=Chocolate';
+const IMPIT_BROWSER = 'chrome';
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
+const MAX_PAGE_ATTEMPTS = 3;
+const MAX_SESSION_REFRESHES = 2;
+const CAPTURE_WAIT_ATTEMPTS = 40;
+const CAPTURE_POLL_MS = 500;
+const NAVIGATION_TIMEOUT_MS = 45000;
+
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
+
+const backoffDelay = (attempt, baseMs = 1000) => {
+    const exponential = baseMs * 2 ** (attempt - 1);
+    const jitter = Math.floor(Math.random() * 400);
+    return Math.min(exponential + jitter, 15000);
+};
+
+const normalizeString = (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
 
 const parsePositiveInt = (value, fallback) => {
     const parsed = Number(value);
@@ -15,34 +31,33 @@ const parsePositiveInt = (value, fallback) => {
     return Math.floor(parsed);
 };
 
-const resolveSearchQuery = ({ query, keyword, startUrl }) => {
-    if (typeof query === 'string' && query.trim()) return query.trim();
-    if (typeof keyword === 'string' && keyword.trim()) return keyword.trim();
-    if (typeof startUrl === 'string' && startUrl.trim()) {
-        try {
-            const parsed = new URL(startUrl);
-            const fromUrl = parsed.searchParams.get('query');
-            if (fromUrl && fromUrl.trim()) return fromUrl.trim();
-        } catch {
-            return undefined;
-        }
+const toUrl = (value) => {
+    try {
+        return new URL(value);
+    } catch {
+        return undefined;
     }
-    return undefined;
 };
 
-const resolveSearchUrl = ({ startUrl, query }) => {
-    if (typeof startUrl === 'string' && startUrl.trim()) {
-        try {
-            const parsed = new URL(startUrl);
-            parsed.searchParams.set('query', query);
-            return parsed.toString();
-        } catch {
-            // fall through to default URL
-        }
+const resolveSearchContext = ({ query, startUrl }) => {
+    const keyword = normalizeString(query);
+    const url = normalizeString(startUrl);
+
+    if (keyword) {
+        const target = toUrl(url) || new URL('https://www.zepto.com/search');
+        target.searchParams.set('query', keyword);
+        return { searchQuery: keyword, searchUrl: target.toString() };
     }
-    const url = new URL('https://www.zepto.com/search');
-    url.searchParams.set('query', query);
-    return url.toString();
+
+    if (url) {
+        const target = toUrl(url);
+        const fromUrl = target?.searchParams.get('query');
+        if (!target || !fromUrl || !fromUrl.trim()) return undefined;
+        return { searchQuery: fromUrl.trim(), searchUrl: target.toString() };
+    }
+
+    const target = new URL(DEFAULT_SEARCH_URL);
+    return { searchQuery: target.searchParams.get('query'), searchUrl: target.toString() };
 };
 
 const sanitizeHeaders = (headers) => {
@@ -223,170 +238,253 @@ const mapProductItem = ({ item, searchQuery, pageNumber }) => {
     return cleanFlatRecord(mapped);
 };
 
-const fetchApiPage = async ({ headers, pageNumber, query, userSessionId, proxyConfiguration }) => {
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+const captureSession = async ({ searchUrl, proxyUrl }) => {
+    const browser = await firefox.launch({
+        headless: true,
+        ...(proxyUrl ? { proxy: { server: proxyUrl } } : {}),
+    });
 
-    let response;
     try {
-        response = await gotScraping.post(API_ENDPOINT, {
-            proxyUrl,
-            headers,
-            json: {
-                query,
-                pageNumber,
-                mode: 'SHOW_ALL_RESULTS',
-                userSessionId,
-            },
-            responseType: 'json',
-            timeout: { request: 30000 },
-            throwHttpErrors: false,
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        const captures = [];
+
+        await page.route('**/*', (route) => {
+            const resourceType = route.request().resourceType();
+            const resourceUrl = route.request().url();
+
+            if (
+                BLOCKED_RESOURCE_TYPES.has(resourceType)
+                || resourceUrl.includes('google-analytics')
+                || resourceUrl.includes('googletagmanager')
+                || resourceUrl.includes('doubleclick')
+                || resourceUrl.includes('facebook')
+            ) {
+                return route.abort();
+            }
+
+            return route.continue();
         });
-    } catch {
-        throw new Error(`Request failed on page ${pageNumber}.`);
-    }
 
-    if (response.statusCode >= 400) {
-        throw new Error(`Request failed on page ${pageNumber}. Status: ${response.statusCode}.`);
-    }
+        page.on('response', async (response) => {
+            try {
+                const responseUrl = response.url();
+                if (!responseUrl.includes(SEARCH_API_MATCH) || responseUrl.includes('/filters')) return;
 
-    return response.body;
+                const rawRequestBody = response.request().postData();
+                let requestBody = {};
+                if (rawRequestBody) {
+                    try {
+                        requestBody = JSON.parse(rawRequestBody);
+                    } catch {
+                        requestBody = {};
+                    }
+                }
+
+                let responseBody = null;
+                try {
+                    responseBody = await response.json();
+                } catch {
+                    responseBody = null;
+                }
+
+                captures.push({ headers: response.request().headers(), requestBody, responseBody });
+            } catch (error) {
+                log.debug(`Failed to capture search response: ${error.message}`);
+            }
+        });
+
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+
+        const hasProducts = (entry) => extractProductItems(entry?.responseBody).length > 0;
+        const selectCapture = () => {
+            const pageZero = captures.filter((entry) => Number(entry?.requestBody?.pageNumber) === 0);
+            return pageZero.find(hasProducts)
+                || captures.find(hasProducts)
+                || pageZero[0]
+                || captures[0];
+        };
+
+        let capture = selectCapture();
+        for (let i = 0; i < CAPTURE_WAIT_ATTEMPTS && !hasProducts(capture); i++) {
+            await page.waitForTimeout(CAPTURE_POLL_MS);
+            capture = selectCapture();
+        }
+
+        if (!capture?.responseBody) {
+            throw new Error('Could not capture search session data from the browser session.');
+        }
+
+        const headers = sanitizeHeaders(capture.headers);
+        const userSessionId = capture.requestBody?.userSessionId || capture.responseBody?.userSessionId;
+
+        if (!userSessionId) {
+            throw new Error('Captured request is missing userSessionId.');
+        }
+
+        return {
+            headers,
+            userSessionId,
+            firstPagePayload: capture.responseBody,
+            firstPageNumber: Number(capture.requestBody?.pageNumber) || 0,
+            firstPageProductCount: extractProductItems(capture.responseBody).length,
+        };
+    } finally {
+        await browser.close().catch(() => {});
+    }
 };
 
-try {
-    const actorInput = await Actor.getInput();
-    let input = actorInput || {};
+const captureSessionWithRetry = async ({ searchUrl, proxyUrl }) => {
+    let lastError;
 
-    if (!actorInput) {
+    for (let attempt = 1; attempt <= MAX_PAGE_ATTEMPTS; attempt++) {
         try {
-            const localInput = await readFile('INPUT.json', 'utf8');
-            input = JSON.parse(localInput);
-            log.info('No Actor input found. Falling back to INPUT.json for local run.');
-        } catch {
-            // Ignore when local file is not present.
+            const session = await captureSession({ searchUrl, proxyUrl });
+            if (session.firstPageProductCount === 0 && attempt < MAX_PAGE_ATTEMPTS) {
+                log.warning(`Captured page 0 returned no products (attempt ${attempt}/${MAX_PAGE_ATTEMPTS}); retrying session setup.`);
+                await sleep(backoffDelay(attempt));
+                continue;
+            }
+            return session;
+        } catch (error) {
+            lastError = error;
+            log.warning(`Session setup failed (attempt ${attempt}/${MAX_PAGE_ATTEMPTS}): ${error.message}`);
+            if (attempt < MAX_PAGE_ATTEMPTS) await sleep(backoffDelay(attempt));
         }
     }
 
+    throw lastError;
+};
+
+const fetchPagePayload = async ({ client, query, pageNumber, session }) => {
+    const response = await client.fetch(API_ENDPOINT, {
+        method: 'POST',
+        headers: session.headers,
+        body: JSON.stringify({
+            query,
+            pageNumber,
+            mode: 'SHOW_ALL_RESULTS',
+            userSessionId: session.userSessionId,
+        }),
+    });
+
+    const body = await response.text();
+    const wafAction = (response.headers.get('x-amzn-waf-action') || '').toLowerCase();
+
+    return { status: response.status, ok: response.ok, wafAction, body };
+};
+
+const fetchPageWithRecovery = async ({ client, query, pageNumber, searchUrl, proxyUrl, session }) => {
+    let currentSession = session;
+    let transientFailures = 0;
+    let refreshes = 0;
+
+    const finish = (payload) => ({ payload, session: currentSession });
+
+    while (transientFailures < MAX_PAGE_ATTEMPTS && refreshes <= MAX_SESSION_REFRESHES) {
+        try {
+            const { status, ok, wafAction, body } = await fetchPagePayload({
+                client,
+                query,
+                pageNumber,
+                session: currentSession,
+            });
+
+            const sessionIssue = status === 202 || status === 401 || status === 403 || wafAction === 'challenge';
+
+            if (sessionIssue) {
+                if (refreshes < MAX_SESSION_REFRESHES) {
+                    refreshes++;
+                    log.warning(`Search session rejected on page ${pageNumber}; refreshing session (${refreshes}/${MAX_SESSION_REFRESHES}).`);
+                    currentSession = await captureSessionWithRetry({ searchUrl, proxyUrl });
+                    continue;
+                }
+                log.warning(`Page ${pageNumber} still blocked after session refresh. Stopping pagination.`);
+                return finish(undefined);
+            }
+
+            if (status === 429 || status >= 500) {
+                transientFailures++;
+                if (transientFailures >= MAX_PAGE_ATTEMPTS) break;
+                log.warning(`Temporary HTTP ${status} on page ${pageNumber} (attempt ${transientFailures}/${MAX_PAGE_ATTEMPTS}).`);
+                await sleep(backoffDelay(transientFailures, 1500));
+                continue;
+            }
+
+            if (!ok) {
+                log.warning(`Page ${pageNumber} returned HTTP ${status}. Stopping pagination.`);
+                return finish(undefined);
+            }
+
+            try {
+                const parsed = JSON.parse(body);
+                if (!parsed || typeof parsed !== 'object') {
+                    log.warning(`Page ${pageNumber} returned an unexpected payload. Stopping pagination.`);
+                    return finish(undefined);
+                }
+                return finish(parsed);
+            } catch {
+                log.warning(`Page ${pageNumber} returned unparseable JSON. Stopping pagination.`);
+                return finish(undefined);
+            }
+        } catch (error) {
+            transientFailures++;
+            if (transientFailures >= MAX_PAGE_ATTEMPTS) break;
+            log.warning(`Request error on page ${pageNumber} (attempt ${transientFailures}/${MAX_PAGE_ATTEMPTS}): ${error.message}`);
+            await sleep(backoffDelay(transientFailures));
+        }
+    }
+
+    return finish(undefined);
+};
+
+await Actor.init();
+
+let exitCode = 0;
+
+try {
+    const input = (await Actor.getInput()) || {};
     const {
         query,
-        keyword,
         startUrl,
-        results_wanted = 20,
-        max_pages = 5,
+        results_wanted: resultsWantedInput,
+        max_pages: maxPagesInput,
         proxyConfiguration: proxyConfig,
     } = input;
 
-    const resultsWanted = parsePositiveInt(results_wanted, 20);
-    const maxPages = parsePositiveInt(max_pages, 5);
-    const searchQuery = resolveSearchQuery({ query, keyword, startUrl });
+    const resultsWanted = parsePositiveInt(resultsWantedInput, 20);
+    const maxPages = parsePositiveInt(maxPagesInput, 5);
 
-    if (!searchQuery) {
-        throw new Error('Missing required input. Provide `query` (or `keyword`) or use `startUrl` with `?query=...`.');
+    const searchContext = resolveSearchContext({ query, startUrl });
+    if (!searchContext) {
+        throw new Error('Missing search input. Provide `query` or a `startUrl` containing a `query` parameter.');
     }
 
-    const searchUrl = resolveSearchUrl({ startUrl, query: searchQuery });
-    const proxyConf = proxyConfig ? await Actor.createProxyConfiguration(proxyConfig) : undefined;
+    const { searchQuery, searchUrl } = searchContext;
 
-    let initialCapture;
+    const proxyConfiguration = proxyConfig ? await Actor.createProxyConfiguration(proxyConfig) : undefined;
+    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
 
-    const crawler = new PlaywrightCrawler({
-        proxyConfiguration: proxyConf,
-        launchContext: {
-            launcher: firefox,
-            launchOptions: {
-                headless: true,
-            },
-        },
-        maxConcurrency: 1,
-        maxRequestRetries: 2,
-        navigationTimeoutSecs: 45,
-        requestHandlerTimeoutSecs: 120,
-        preNavigationHooks: [
-            async ({ page, request }) => {
-                request.userData.apiCaptures = [];
-
-                await page.route('**/*', (route) => {
-                    const resourceType = route.request().resourceType();
-                    const resourceUrl = route.request().url();
-
-                    if (
-                        BLOCKED_RESOURCE_TYPES.has(resourceType)
-                        || resourceUrl.includes('google-analytics')
-                        || resourceUrl.includes('googletagmanager')
-                        || resourceUrl.includes('doubleclick')
-                        || resourceUrl.includes('facebook')
-                    ) {
-                        return route.abort();
-                    }
-
-                    return route.continue();
-                });
-
-                page.on('response', async (response) => {
-                    try {
-                        const responseUrl = response.url();
-                        if (!responseUrl.includes('/user-search-service/api/v3/search') || responseUrl.includes('/filters')) {
-                            return;
-                        }
-
-                        const requestBodyRaw = response.request().postData();
-                        const requestBody = requestBodyRaw ? JSON.parse(requestBodyRaw) : {};
-                        const responseBody = await response.json();
-
-                        request.userData.apiCaptures.push({
-                            status: response.status(),
-                            headers: response.request().headers(),
-                            requestBody,
-                            responseBody,
-                        });
-                    } catch (error) {
-                        log.debug(`Failed to capture search response: ${error.message}`);
-                    }
-                });
-            },
-        ],
-        async requestHandler({ page, request }) {
-            log.info(`Opening search page: ${request.url}`);
-
-            await page.waitForLoadState('domcontentloaded');
-
-            for (let i = 0; i < 20 && request.userData.apiCaptures.length === 0; i++) {
-                await page.waitForTimeout(500);
-            }
-
-            initialCapture = request.userData.apiCaptures
-                .find((capture) => Number(capture?.requestBody?.pageNumber) === 0)
-                || request.userData.apiCaptures[0];
-
-            if (!initialCapture) {
-                throw new Error('Could not capture search session data from browser session.');
-            }
-
-            log.info('Captured search session data successfully.');
-        },
+    const client = new Impit({
+        browser: IMPIT_BROWSER,
+        ...(proxyUrl ? { proxyUrl } : {}),
     });
 
-    await crawler.run([{ url: searchUrl }]);
-
-    if (!initialCapture?.responseBody) {
-        throw new Error('Failed to capture initial search payload.');
-    }
-
-    const requestHeaders = sanitizeHeaders(initialCapture.headers);
-    const userSessionId = initialCapture.requestBody?.userSessionId || initialCapture.responseBody?.userSessionId;
-
-    if (!userSessionId) {
-        throw new Error('Captured request is missing `userSessionId`.');
-    }
+    let session = await captureSessionWithRetry({ searchUrl, proxyUrl });
+    log.info(`Search session ready for "${searchQuery}" (page 0: ${session.firstPageProductCount} product(s)).`);
 
     const seenIds = new Set();
-    let totalSaved = 0;
+    const collectedRecords = [];
     let pagesProcessed = 0;
+    let stopReason = 'completed';
 
-    const pushPageProducts = async ({ payload, pageNumber }) => {
+    const collectPage = ({ payload, pageNumber }) => {
         const products = extractProductItems(payload);
-        const output = [];
+        let collected = 0;
 
         for (const item of products) {
+            if (collectedRecords.length >= resultsWanted) break;
+
             const uniqueId = item?.id || item?.objectId || item?.productVariant?.id || item?.product?.id;
             if (!uniqueId || seenIds.has(uniqueId)) continue;
 
@@ -394,58 +492,60 @@ try {
             if (Object.keys(mappedItem).length === 0) continue;
 
             seenIds.add(uniqueId);
-            output.push(mappedItem);
-
-            if (totalSaved + output.length >= resultsWanted) break;
+            collectedRecords.push(mappedItem);
+            collected++;
         }
 
-        if (output.length > 0) {
-            await Dataset.pushData(output);
-            totalSaved += output.length;
+        if (collected > 0) {
+            log.info(`Collected ${collected} product(s) from page ${pageNumber}. Total: ${collectedRecords.length}/${resultsWanted}.`);
         }
 
-        return output.length;
+        return collected;
     };
 
-    const firstPageNumber = Number(initialCapture.requestBody?.pageNumber) || 0;
-    await pushPageProducts({ payload: initialCapture.responseBody, pageNumber: firstPageNumber });
+    collectPage({ payload: session.firstPagePayload, pageNumber: session.firstPageNumber });
     pagesProcessed++;
 
-    log.info(`Saved ${totalSaved} product(s) from page ${firstPageNumber}.`);
+    let nextPage = session.firstPageNumber + 1;
+    let hasReachedEnd = Boolean(session.firstPagePayload?.hasReachedEnd);
 
-    let nextPage = firstPageNumber + 1;
-    let hasReachedEnd = Boolean(initialCapture.responseBody?.hasReachedEnd);
-
-    while (totalSaved < resultsWanted && pagesProcessed < maxPages && !hasReachedEnd) {
-        log.info(`Fetching page ${nextPage}...`);
-        const pagePayload = await fetchApiPage({
-            headers: requestHeaders,
-            pageNumber: nextPage,
+    while (collectedRecords.length < resultsWanted && pagesProcessed < maxPages && !hasReachedEnd) {
+        const result = await fetchPageWithRecovery({
+            client,
             query: searchQuery,
-            userSessionId,
-            proxyConfiguration: proxyConf,
+            pageNumber: nextPage,
+            searchUrl,
+            proxyUrl,
+            session,
         });
 
-        const savedNow = await pushPageProducts({ payload: pagePayload, pageNumber: nextPage });
+        session = result.session;
+
+        const pagePayload = result.payload;
+        if (!pagePayload) {
+            stopReason = `page_${nextPage}_unavailable`;
+            break;
+        }
+
+        const collectedNow = collectPage({ payload: pagePayload, pageNumber: nextPage });
         pagesProcessed++;
         hasReachedEnd = Boolean(pagePayload?.hasReachedEnd);
 
-        log.info(`Saved ${savedNow} new product(s) from page ${nextPage}. Total: ${totalSaved}/${resultsWanted}`);
-
-        if (savedNow === 0 && hasReachedEnd) break;
+        if (collectedNow === 0 && hasReachedEnd) break;
         nextPage++;
     }
 
-    if (totalSaved === 0) {
+    if (collectedRecords.length === 0) {
         throw new Error('Run completed but no products were extracted.');
     }
 
-    log.info(`Extraction complete. Saved ${totalSaved} product(s) for query "${searchQuery}".`);
+    await Actor.pushData(collectedRecords);
+    log.info(`Flushed ${collectedRecords.length} product(s) to the dataset.`);
+    log.info(`Done | query="${searchQuery}" | saved=${collectedRecords.length} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
 } catch (error) {
-    const safeMessage = String(error?.message || 'Unknown error')
-        .replace(/https?:\/\/\S+/gi, '[redacted]');
+    exitCode = 1;
+    const safeMessage = String(error?.message || 'Unknown error').replace(/https?:\/\/\S+/gi, '[redacted]');
     log.error(`Actor failed: ${safeMessage}`);
-    throw error;
-} finally {
-    await Actor.exit();
 }
+
+await Actor.exit({ exitCode });

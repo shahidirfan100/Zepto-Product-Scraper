@@ -38,19 +38,19 @@ Each dataset item represents one product or product variant returned for the sea
 5. Start the run and review the dataset preview.
 6. Download the results or connect the dataset to your next workflow.
 
-If both `query` and `startUrl` are supplied, the search term from `query` is used and synchronized into the URL. A usable `query`, or a `startUrl` containing a `query` parameter, is required even though the schema marks the fields as optional.
+If both `query` and `startUrl` are supplied, the search term from `query` is used and synchronized into the URL. When neither is supplied, the Actor runs the default search URL. A usable `query`, or a `startUrl` containing a `query` parameter, is required.
 
 ## Input Parameters
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `query` | String | No* | `"Chocolate"` | Product search term to collect from Zepto. |
-| `startUrl` | String | No* | `"https://www.zepto.com/search?query=Chocolate"` | Public Zepto search URL. Its `query` parameter is used when `query` is not supplied, and is synchronized when both are supplied. |
+| `query` | String | No | (none) | Product search term to collect from Zepto. Takes precedence over `startUrl` when supplied. |
+| `startUrl` | String | No | `"https://www.zepto.com/search?query=Chocolate"` | Public Zepto search URL. Its `query` parameter is used when `query` is not supplied. |
 | `results_wanted` | Integer | No | `20` | Maximum number of unique product records to save. The minimum accepted value is `1`. |
 | `max_pages` | Integer | No | `5` | Maximum number of search result pages to process. The minimum accepted value is `1`. |
 | `proxyConfiguration` | Object | No | `{ "useApifyProxy": false }` | Optional Apify Proxy configuration for the run. |
 
-`*` At least one usable search input is required. The public input schema accepts `query`, `startUrl`, `results_wanted`, `max_pages`, and `proxyConfiguration`.
+The public input schema accepts `query`, `startUrl`, `results_wanted`, `max_pages`, and `proxyConfiguration`.
 
 ## Output Data
 
@@ -179,6 +179,7 @@ The following is one example of a dataset item. Values and available fields vary
 - Zepto price values are converted to INR rupees before they are saved.
 - Product descriptions and usage instructions are normalized into text. Attribute tags are kept as unique string values.
 - `scraped_at` records the collection time, while `page_number` and `search_query` preserve run context.
+- The Actor automatically retries temporary network and rate-limit failures, refreshes its search session when it is rejected, and keeps records already collected if a later page becomes unavailable.
 
 ## Tips for best results
 
