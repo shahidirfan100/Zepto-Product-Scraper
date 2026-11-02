@@ -37,7 +37,7 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Use Apify Proxy for better reliability.",
+      "description": "Route requests through Apify Proxy. An Indian residential proxy also changes the delivery store used for prices and stock.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": false

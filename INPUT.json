@@ -1,5 +1,1 @@
-{
-  "query": "Chocolate",
-  "results_wanted": 20,
-  "max_pages": 5
-}
+{"query":"Chocolate","results_wanted":20,"max_pages":5}

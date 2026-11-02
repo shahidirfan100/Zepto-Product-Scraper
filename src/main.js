@@ -2,30 +2,64 @@ import { Actor, log } from 'apify';
 import { Impit } from 'impit';
 import { firefox } from 'playwright';
 
-const API_ENDPOINT = 'https://bff-gateway.zepto.com/user-search-service/api/v3/search';
-const SEARCH_API_MATCH = '/user-search-service/api/v3/search';
+// When a run fails, read API_DISCOVERY.md before changing request code. It records the live session flow.
+const SEARCH_API_MARKER = '/user-search-service/api/v3/search';
 const DEFAULT_SEARCH_URL = 'https://www.zepto.com/search?query=Chocolate';
-const IMPIT_BROWSER = 'chrome';
-const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
-const MAX_PAGE_ATTEMPTS = 3;
-const MAX_SESSION_REFRESHES = 2;
+const HOMEPAGE_URL = 'https://www.zepto.com/';
+const LITE_SEARCH_URL = 'https://lite.zeptonow.com/search';
+const LITE_HOMEPAGE_URL = 'https://lite.zeptonow.com/';
+const LITE_USER_AGENT =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+const DESKTOP_VIEWPORT = { width: 1366, height: 900 };
+const MOBILE_VIEWPORT = { width: 390, height: 844 };
+const SESSION_VARIANTS = ['desktop', 'lite'];
+
+// Fresh sessions accepted all three profiles in testing. chrome142 reset connections,
+// so it is excluded from the rotation.
+const IMPIT_PROFILES = ['chrome', 'okhttp4', 'firefox'];
+
+const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media']);
+const BLOCKED_URL_PARTS = [
+    'google-analytics',
+    'googletagmanager',
+    'doubleclick',
+    'connect.facebook.net',
+    'hotjar',
+    'clarity.ms',
+];
+
+const NAVIGATION_TIMEOUT_MS = 45000;
 const CAPTURE_WAIT_MS = 15000;
 const CAPTURE_POLL_MS = 250;
-const WARMUP_URL = 'https://www.zepto.com/';
-const WARMUP_WAIT_MS = 3000;
-const NAVIGATION_TIMEOUT_MS = 30000;
+const HOME_SETTLE_MS = 3000;
+const MAX_SESSION_ATTEMPTS = 2;
+const MAX_SESSION_REFRESHES = 2;
+const MAX_PAGE_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 30000;
+const MAX_SCROLL_STEPS = 40;
+const SCROLL_WAIT_MS = 900;
+const MAX_EMPTY_SCROLLS = 3;
 
-const sleep = (ms) => new Promise((resolve) => {
-    setTimeout(resolve, ms);
-});
+const DEFAULT_RESULTS_WANTED = 20;
+const DEFAULT_MAX_PAGES = 5;
 
-const backoffDelay = (attempt, baseMs = 1000) => {
+const sleep = (ms) =>
+    new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+
+const backoffDelay = (attempt, baseMs = 900) => {
     const exponential = baseMs * 2 ** (attempt - 1);
-    const jitter = Math.floor(Math.random() * 400);
-    return Math.min(exponential + jitter, 15000);
+    const jitter = Math.floor(Math.random() * 350);
+    return Math.min(exponential + jitter, 8000);
 };
 
 const normalizeString = (value) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+
+const shortError = (error) =>
+    String(error?.message || error || 'unknown error')
+        .split('\n')[0]
+        .slice(0, 180);
 
 const parsePositiveInt = (value, fallback) => {
     const parsed = Number(value);
@@ -43,83 +77,86 @@ const toUrl = (value) => {
 
 const resolveSearchContext = ({ query, startUrl }) => {
     const keyword = normalizeString(query);
-    const url = normalizeString(startUrl);
 
     if (keyword) {
-        const target = toUrl(url) || new URL('https://www.zepto.com/search');
+        const target = new URL(DEFAULT_SEARCH_URL);
         target.searchParams.set('query', keyword);
         return { searchQuery: keyword, searchUrl: target.toString() };
     }
 
-    if (url) {
-        const target = toUrl(url);
-        const fromUrl = target?.searchParams.get('query');
-        if (!target || !fromUrl || !fromUrl.trim()) return undefined;
-        return { searchQuery: fromUrl.trim(), searchUrl: target.toString() };
+    const rawUrl = normalizeString(startUrl);
+    const url = toUrl(rawUrl);
+    const fromUrl = url?.searchParams.get('query');
+    if (rawUrl) {
+        if (!url || !fromUrl?.trim()) {
+            throw new Error(
+                'startUrl must be a valid Zepto search URL with a query parameter, or use the query field instead.',
+            );
+        }
+        return { searchQuery: fromUrl.trim(), searchUrl: url.toString() };
     }
 
     const target = new URL(DEFAULT_SEARCH_URL);
-    return { searchQuery: target.searchParams.get('query'), searchUrl: target.toString() };
+    const fallbackQuery = target.searchParams.get('query');
+    return { searchQuery: fallbackQuery, searchUrl: target.toString() };
 };
 
-const sanitizeHeaders = (headers) => {
-    const excluded = new Set(['content-length', 'host', 'connection']);
-    const sanitized = {};
-
-    for (const [key, value] of Object.entries(headers || {})) {
-        const lower = key.toLowerCase();
-        if (excluded.has(lower)) continue;
-        if (typeof value !== 'string' || !value.trim()) continue;
-        sanitized[lower] = value;
-    }
-
-    sanitized.accept = sanitized.accept || 'application/json, text/plain, */*';
-    sanitized['content-type'] = 'application/json';
-    sanitized.referer = sanitized.referer || 'https://www.zepto.com/';
-    sanitized.origin = sanitized.origin || 'https://www.zepto.com';
-
-    return sanitized;
+const buildVariantSearchUrl = (query, variant) => {
+    const target = new URL(variant === 'lite' ? LITE_SEARCH_URL : DEFAULT_SEARCH_URL);
+    target.searchParams.set('query', query);
+    return target.toString();
 };
 
-const extractProductItems = (payload) => {
-    const items = [];
+const productId = (item) => item?.objectId || item?.id || item?.productVariant?.id || item?.product?.id;
+
+const isProductNode = (node) =>
+    Boolean(node && typeof node === 'object' && node.product && node.productVariant && productId(node));
+
+const extractProducts = (payload) => {
+    const products = [];
     const seen = new Set();
 
-    const pushCandidate = (candidate) => {
-        const uniqueId = candidate?.id || candidate?.objectId || candidate?.productVariant?.id || candidate?.product?.id;
-        if (!uniqueId || seen.has(uniqueId)) return;
-        seen.add(uniqueId);
-        items.push(candidate);
+    const push = (node) => {
+        if (!isProductNode(node)) return;
+        const id = productId(node);
+        if (seen.has(id)) return;
+        seen.add(id);
+        products.push(node);
     };
+
+    // The grid widget wraps every card as item.productResponse. Sponsored brand
+    // carousels nest unrelated products deeper in an item, so only read this level.
+    const layout = Array.isArray(payload?.layout) ? payload.layout : [];
+    for (const widget of layout) {
+        const items = widget?.data?.resolver?.data?.items;
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+            push(item?.productResponse);
+            push(item?.data);
+        }
+    }
+    if (products.length > 0) return products;
 
     const walk = (node) => {
         if (Array.isArray(node)) {
             for (const child of node) walk(child);
             return;
         }
-
         if (!node || typeof node !== 'object') return;
-
-        if (node.type === 'PRODUCT_ITEM' && node.data && typeof node.data === 'object') {
-            pushCandidate(node.data);
+        if (isProductNode(node)) {
+            push(node);
+            return;
         }
-
-        if (node.product && node.productVariant) {
-            pushCandidate(node);
-        }
-
-        for (const value of Object.values(node)) {
-            walk(value);
-        }
+        for (const value of Object.values(node)) walk(value);
     };
-
     walk(payload);
-    return items;
+
+    return products;
 };
 
 const toRupees = (value) => {
     const amount = Number(value);
-    if (!Number.isFinite(amount)) return undefined;
+    if (!Number.isFinite(amount) || amount <= 0) return undefined;
     return Number((amount / 100).toFixed(2));
 };
 
@@ -131,9 +168,7 @@ const buildImageUrl = (imagePath) => {
 
 const normalizeTextList = (value) => {
     if (Array.isArray(value)) {
-        const items = value
-            .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-            .filter(Boolean);
+        const items = value.map((entry) => (typeof entry === 'string' ? entry.trim() : '')).filter(Boolean);
         return items.length > 0 ? items.join(' | ') : undefined;
     }
     if (typeof value === 'string' && value.trim()) return value.trim();
@@ -144,10 +179,14 @@ const extractAttributeTags = (item) => {
     const tags = item?.productCardTags?.slot3;
     if (!Array.isArray(tags)) return undefined;
 
-    const values = [...new Set(tags
-        .filter((tag) => tag?.tagType === 'ATTRIBUTE' && typeof tag?.tagName === 'string')
-        .map((tag) => tag.tagName.trim())
-        .filter(Boolean))];
+    const values = [
+        ...new Set(
+            tags
+                .filter((tag) => tag?.tagType === 'ATTRIBUTE' && typeof tag?.tagName === 'string')
+                .map((tag) => tag.tagName.trim())
+                .filter(Boolean),
+        ),
+    ];
 
     return values.length > 0 ? values : undefined;
 };
@@ -177,9 +216,7 @@ const cleanFlatRecord = (record) => {
         }
 
         if (Array.isArray(value)) {
-            const normalized = value
-                .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-                .filter(Boolean);
+            const normalized = value.map((entry) => (typeof entry === 'string' ? entry.trim() : '')).filter(Boolean);
             if (normalized.length > 0) cleaned[key] = normalized;
         }
     }
@@ -240,210 +277,560 @@ const mapProductItem = ({ item, searchQuery, pageNumber }) => {
     return cleanFlatRecord(mapped);
 };
 
-const captureSession = async ({ searchUrl, proxyUrl }) => {
+// Captured headers include browser fingerprint fields. Drop those and let the impit
+// profile generate a coherent set, keeping only the values the API verifies.
+const DROPPED_HEADERS = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'accept-encoding',
+    'user-agent',
+    'accept',
+    'accept-language',
+    'priority',
+    'upgrade-insecure-requests',
+    'sec-fetch-dest',
+    'sec-fetch-mode',
+    'sec-fetch-site',
+    'sec-fetch-user',
+]);
+
+const sanitizeHeaders = (rawHeaders = {}, { variant = 'desktop' } = {}) => {
+    const headers = {};
+    const siteOrigin = variant === 'lite' ? 'https://lite.zeptonow.com' : 'https://www.zepto.com';
+
+    for (const [key, value] of Object.entries(rawHeaders)) {
+        const lower = key.toLowerCase();
+        if (DROPPED_HEADERS.has(lower) || lower.startsWith('sec-ch-')) continue;
+        if (typeof value !== 'string' || !value.trim()) continue;
+        headers[lower] = value;
+    }
+
+    headers['content-type'] = 'application/json';
+    headers.accept = headers.accept || 'application/json, text/plain, */*';
+    headers.origin = headers.origin || siteOrigin;
+    headers.referer = headers.referer || `${siteOrigin}/`;
+
+    return headers;
+};
+
+const parseJson = (text) => {
+    try {
+        return JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+};
+
+const launchBrowser = async ({ proxyUrl, variant }) => {
+    const proxy = (() => {
+        if (!proxyUrl) return undefined;
+        const url = toUrl(proxyUrl);
+        if (!url) return undefined;
+        return {
+            server: `${url.protocol}//${url.hostname}:${url.port}`,
+            ...(url.username
+                ? { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) }
+                : {}),
+        };
+    })();
+
     const browser = await firefox.launch({
         headless: true,
-        ...(proxyUrl ? { proxy: { server: proxyUrl } } : {}),
+        ...(proxy ? { proxy } : {}),
+    });
+    const context = await browser.newContext({
+        locale: 'en-IN',
+        timezoneId: 'Asia/Kolkata',
+        viewport: variant === 'lite' ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT,
+        ...(variant === 'lite' ? { userAgent: LITE_USER_AGENT, hasTouch: true } : {}),
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(30000);
+
+    await page.route('**/*', (route) => {
+        const resourceType = route.request().resourceType();
+        const resourceUrl = route.request().url();
+        if (BLOCKED_RESOURCE_TYPES.has(resourceType)) return route.abort();
+        if (BLOCKED_URL_PARTS.some((part) => resourceUrl.includes(part))) return route.abort();
+        return route.continue();
     });
 
+    return { browser, context, page };
+};
+
+const closeSession = async (session) => {
+    if (!session?.browser) return;
+    await session.browser.close().catch(() => {});
+};
+
+const attachCaptureListeners = ({ page, captures, onStoreReady }) => {
+    page.on('response', (response) => {
+        const url = response.url();
+
+        if (url.includes('/lms/api/v2/get_page') && response.status() === 200) onStoreReady();
+
+        if (!url.includes(SEARCH_API_MARKER) || url.includes('/filters')) return;
+
+        Promise.resolve()
+            .then(async () => {
+                const payload = await response.json();
+                if (!payload || typeof payload !== 'object') return;
+                const request = response.request();
+                captures.push({
+                    url,
+                    status: response.status(),
+                    headers: request.headers(),
+                    requestBody: parseJson(request.postData() || '') || {},
+                    payload,
+                    products: extractProducts(payload),
+                    capturedAt: Date.now(),
+                });
+            })
+            .catch(() => {});
+    });
+};
+
+const selectCapture = (captures) => {
+    const usable = captures.filter((entry) => entry.status === 200 && Array.isArray(entry.payload?.layout));
+    const withProducts = usable
+        .filter((entry) => entry.products.length > 0)
+        .sort((a, b) => b.products.length - a.products.length);
+    if (withProducts.length > 0) return withProducts[0];
+
+    return usable.find(
+        (entry) => Number(entry.payload?.totalProductCount) === 0 || entry.payload?.hasReachedEnd === true,
+    );
+};
+
+const waitForCapture = async (captures, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    let errorSeenAt = 0;
+
+    while (Date.now() < deadline) {
+        const capture = selectCapture(captures);
+        if (capture) return capture;
+
+        // A guest session that is still warming up answers with LOGIN_REQUIRED.
+        // Retry navigation after a short grace period instead of waiting out the full timeout.
+        if (!errorSeenAt && captures.some((entry) => entry.payload?.error_code)) errorSeenAt = Date.now();
+        if (errorSeenAt && Date.now() - errorSeenAt > 1500) return undefined;
+
+        await sleep(CAPTURE_POLL_MS);
+    }
+
+    return undefined;
+};
+
+const readPageText = async (page) => {
     try {
-        const page = await browser.newPage();
-        const captures = [];
-
-        await page.route('**/*', (route) => {
-            const resourceType = route.request().resourceType();
-            const resourceUrl = route.request().url();
-
-            if (
-                BLOCKED_RESOURCE_TYPES.has(resourceType)
-                || resourceUrl.includes('google-analytics')
-                || resourceUrl.includes('googletagmanager')
-                || resourceUrl.includes('doubleclick')
-                || resourceUrl.includes('facebook')
-            ) {
-                return route.abort();
-            }
-
-            return route.continue();
-        });
-
-        page.on('response', async (response) => {
-            try {
-                const responseUrl = response.url();
-                if (!responseUrl.includes(SEARCH_API_MATCH) || responseUrl.includes('/filters')) return;
-
-                const rawRequestBody = response.request().postData();
-                let requestBody = {};
-                if (rawRequestBody) {
-                    try {
-                        requestBody = JSON.parse(rawRequestBody);
-                    } catch {
-                        requestBody = {};
-                    }
-                }
-
-                let responseBody = null;
-                try {
-                    responseBody = await response.json();
-                } catch {
-                    responseBody = null;
-                }
-
-                captures.push({ headers: response.request().headers(), requestBody, responseBody });
-            } catch (error) {
-                log.debug(`Failed to capture search response: ${error.message}`);
-            }
-        });
-
-        const hasProducts = (entry) => extractProductItems(entry?.responseBody).length > 0;
-        const selectCapture = () => {
-            const pageZero = captures.filter((entry) => Number(entry?.requestBody?.pageNumber) === 0);
-            return pageZero.find(hasProducts)
-                || captures.find(hasProducts)
-                || pageZero[0]
-                || captures[0];
-        };
-
-        await page.goto(WARMUP_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-        await page.waitForTimeout(WARMUP_WAIT_MS);
-        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-
-        let capture = selectCapture();
-        const deadline = Date.now() + CAPTURE_WAIT_MS;
-        while (Date.now() < deadline && !hasProducts(capture)) {
-            await page.waitForTimeout(CAPTURE_POLL_MS);
-            capture = selectCapture();
-        }
-
-        if (!capture?.responseBody) {
-            throw new Error('Could not capture search session data from the browser session.');
-        }
-
-        const headers = sanitizeHeaders(capture.headers);
-        const userSessionId = capture.requestBody?.userSessionId || capture.responseBody?.userSessionId;
-
-        if (!userSessionId) {
-            throw new Error('Captured request is missing userSessionId.');
-        }
-
-        return {
-            headers,
-            userSessionId,
-            firstPagePayload: capture.responseBody,
-            firstPageNumber: Number(capture.requestBody?.pageNumber) || 0,
-            firstPageProductCount: extractProductItems(capture.responseBody).length,
-        };
-    } finally {
-        await browser.close().catch(() => {});
+        return await page.evaluate(() => document.body?.innerText?.slice(0, 4000) || '');
+    } catch {
+        return '';
     }
 };
 
-const captureSessionWithRetry = async ({ searchUrl, proxyUrl }) => {
+const BLOCKED_PAGE_PATTERN = /captcha|verify you are human|access denied|forbidden|http error 429|request blocked/i;
+const UNSERVICEABLE_PATTERN = /sit tight|coming soon|not serviceable|try again in/i;
+
+const createSessionError = (message, code) => Object.assign(new Error(message), { code });
+
+const captureSession = async ({ searchUrl, proxyUrl, variant }) => {
+    const { browser, context, page } = await launchBrowser({ proxyUrl, variant });
+    const captures = [];
+    let storeReady = false;
+
+    attachCaptureListeners({
+        page,
+        captures,
+        onStoreReady: () => {
+            storeReady = true;
+        },
+    });
+
+    let handedOff = false;
+    try {
+        if (variant === 'lite') {
+            await page
+                .goto(LITE_HOMEPAGE_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS })
+                .catch(() => {});
+            await sleep(1500);
+        } else {
+            let homeLoaded = false;
+            for (let attempt = 1; attempt <= 2 && !homeLoaded; attempt++) {
+                try {
+                    await page.goto(HOMEPAGE_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+                    homeLoaded = true;
+                } catch (error) {
+                    log.debug(`Homepage attempt ${attempt} failed: ${shortError(error)}`);
+                    await sleep(backoffDelay(attempt));
+                }
+            }
+
+            if (!homeLoaded) throw new Error('Could not open the Zepto storefront.');
+
+            const storeDeadline = Date.now() + 8000;
+            while (!storeReady && Date.now() < storeDeadline) await page.waitForTimeout(250);
+            await sleep(HOME_SETTLE_MS);
+        }
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+            } catch (error) {
+                log.debug(`Search navigation attempt ${attempt} failed: ${shortError(error)}`);
+            }
+
+            const capture = await waitForCapture(captures, CAPTURE_WAIT_MS);
+            if (capture) {
+                const headers = sanitizeHeaders(capture.headers, { variant });
+                const requestBody = capture.requestBody || {};
+                const userSessionId = requestBody.userSessionId || capture.payload?.userSessionId;
+
+                if (!headers.cookie) throw new Error('Captured session has no cookie.');
+                if (!userSessionId) throw new Error('Captured request is missing userSessionId.');
+                if (!headers['request-signature'])
+                    log.warning('Captured session has no request-signature; page requests may be rejected.');
+
+                const session = {
+                    browser,
+                    context,
+                    page,
+                    captures,
+                    variant,
+                    endpoint: capture.url,
+                    headers,
+                    requestBody,
+                    userSessionId,
+                    payload: capture.payload,
+                    pageNumber: Number(requestBody.pageNumber) || Number(capture.payload?.currentPage) || 0,
+                    productCount: capture.products.length,
+                    storeId: headers.store_id || headers.storeid,
+                };
+                handedOff = true;
+                return session;
+            }
+
+            const pageText = await readPageText(page);
+            const loginRequired =
+                captures.some((entry) => entry.payload?.error_code === 'LOGIN_REQUIRED') ||
+                /please login to continue/i.test(pageText);
+
+            if (loginRequired) {
+                throw createSessionError(
+                    'Zepto is asking this IP to log in before searching. Enable an Indian residential proxy and retry.',
+                    'LOGIN_REQUIRED',
+                );
+            }
+            if (BLOCKED_PAGE_PATTERN.test(pageText)) {
+                throw createSessionError('Zepto returned a challenge page instead of search results.', 'BLOCKED');
+            }
+            if (attempt === 1) {
+                log.warning('Search page returned no product data; retrying navigation once.');
+                await sleep(2000);
+            } else if (UNSERVICEABLE_PATTERN.test(pageText)) {
+                throw createSessionError('Zepto has no serviceable store for this session.', 'UNSERVICEABLE');
+            } else {
+                throw createSessionError('Search page returned no product data.', 'EMPTY');
+            }
+        }
+
+        throw new Error('Could not capture a search session.');
+    } finally {
+        if (!handedOff) await browser.close().catch(() => {});
+    }
+};
+
+const setupSessionWithRetry = async ({ searchUrl, query, proxyUrl, variants = SESSION_VARIANTS }) => {
     let lastError;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-            const session = await captureSession({ searchUrl, proxyUrl });
-            if (session.firstPageProductCount === 0 && attempt < 2) {
-                log.warning('Captured page 0 returned no products; retrying session setup once.');
-                continue;
-            }
-            return session;
-        } catch (error) {
-            lastError = error;
-            log.warning(`Session setup failed (attempt ${attempt}/2): ${error.message}`);
-            if (attempt < 2) await sleep(backoffDelay(attempt, 500));
-        }
-    }
-
-    throw lastError;
-};
-
-const fetchPagePayload = async ({ client, query, pageNumber, session }) => {
-    const response = await client.fetch(API_ENDPOINT, {
-        method: 'POST',
-        headers: session.headers,
-        body: JSON.stringify({
-            query,
-            pageNumber,
-            mode: 'SHOW_ALL_RESULTS',
-            userSessionId: session.userSessionId,
-        }),
-    });
-
-    const body = await response.text();
-    const wafAction = (response.headers.get('x-amzn-waf-action') || '').toLowerCase();
-
-    return { status: response.status, ok: response.ok, wafAction, body };
-};
-
-const fetchPageWithRecovery = async ({ client, query, pageNumber, searchUrl, proxyUrl, session }) => {
-    let currentSession = session;
-    let transientFailures = 0;
-    let refreshes = 0;
-
-    const finish = (payload) => ({ payload, session: currentSession });
-
-    while (transientFailures < MAX_PAGE_ATTEMPTS && refreshes <= MAX_SESSION_REFRESHES) {
-        try {
-            const { status, ok, wafAction, body } = await fetchPagePayload({
-                client,
-                query,
-                pageNumber,
-                session: currentSession,
-            });
-
-            const sessionIssue = status === 202 || status === 401 || status === 403 || wafAction === 'challenge';
-
-            if (sessionIssue) {
-                if (refreshes < MAX_SESSION_REFRESHES) {
-                    refreshes++;
-                    log.warning(`Search session rejected on page ${pageNumber}; refreshing session (${refreshes}/${MAX_SESSION_REFRESHES}).`);
-                    currentSession = await captureSessionWithRetry({ searchUrl, proxyUrl });
+    for (const variant of variants) {
+        for (let attempt = 1; attempt <= MAX_SESSION_ATTEMPTS; attempt++) {
+            const variantUrl = variant === 'lite' ? buildVariantSearchUrl(query, 'lite') : searchUrl;
+            try {
+                const session = await captureSession({ searchUrl: variantUrl, proxyUrl, variant });
+                if (session.productCount === 0 && Number(session.payload?.totalProductCount) > 0) {
+                    log.warning(`Captured page 0 was empty on the ${variant} storefront; retrying session setup.`);
+                    await closeSession(session);
                     continue;
                 }
-                log.warning(`Page ${pageNumber} still blocked after session refresh. Stopping pagination.`);
-                return finish(undefined);
+                return session;
+            } catch (error) {
+                lastError = error;
+                log.warning(
+                    `Session setup failed on the ${variant} storefront (attempt ${attempt}/${MAX_SESSION_ATTEMPTS}): ${shortError(error)}`,
+                );
+                if (attempt < MAX_SESSION_ATTEMPTS) await sleep(backoffDelay(attempt, 1200));
             }
-
-            if (status === 429 || status >= 500) {
-                transientFailures++;
-                if (transientFailures >= MAX_PAGE_ATTEMPTS) break;
-                log.warning(`Temporary HTTP ${status} on page ${pageNumber} (attempt ${transientFailures}/${MAX_PAGE_ATTEMPTS}).`);
-                await sleep(backoffDelay(transientFailures, 1500));
-                continue;
-            }
-
-            if (!ok) {
-                log.warning(`Page ${pageNumber} returned HTTP ${status}. Stopping pagination.`);
-                return finish(undefined);
-            }
-
-            try {
-                const parsed = JSON.parse(body);
-                if (!parsed || typeof parsed !== 'object') {
-                    log.warning(`Page ${pageNumber} returned an unexpected payload. Stopping pagination.`);
-                    return finish(undefined);
-                }
-                return finish(parsed);
-            } catch {
-                log.warning(`Page ${pageNumber} returned unparseable JSON. Stopping pagination.`);
-                return finish(undefined);
-            }
-        } catch (error) {
-            transientFailures++;
-            if (transientFailures >= MAX_PAGE_ATTEMPTS) break;
-            log.warning(`Request error on page ${pageNumber} (attempt ${transientFailures}/${MAX_PAGE_ATTEMPTS}): ${error.message}`);
-            await sleep(backoffDelay(transientFailures));
         }
     }
 
-    return finish(undefined);
+    throw lastError || new Error('Could not establish a Zepto search session.');
+};
+
+const buildRequestBody = ({ session, query, pageNumber }) => {
+    const body = { ...(session.requestBody || {}) };
+    body.query = query;
+    body.pageNumber = pageNumber;
+    if (body.mode === undefined || body.mode === null || body.mode === '') body.mode = 'SHOW_ALL_RESULTS';
+    if (!body.userSessionId) body.userSessionId = session.userSessionId;
+    return body;
+};
+
+const createClient = (profile, proxyUrl) =>
+    new Impit({
+        browser: profile,
+        ...(proxyUrl ? { proxyUrl } : {}),
+    });
+
+class RunState {
+    constructor({ proxyUrl, resultsWanted }) {
+        this.session = undefined;
+        this.clients = new Map();
+        this.proxyUrl = proxyUrl;
+        this.resultsWanted = resultsWanted;
+        this.seenIds = new Set();
+        this.totalSaved = 0;
+        this.pagesProcessed = 0;
+        this.profileIndex = 0;
+        this.browserPages = new Set();
+    }
+
+    rotateProfile() {
+        this.profileIndex++;
+    }
+
+    replaceSession(session) {
+        this.session = session;
+        this.profileIndex = 0;
+    }
+
+    markSeen(id) {
+        this.seenIds.add(id);
+    }
+
+    hasSeen(id) {
+        return this.seenIds.has(id);
+    }
+
+    addSaved(count) {
+        this.totalSaved += count;
+    }
+
+    recordPage() {
+        this.pagesProcessed++;
+    }
+
+    markBrowserPage(pageNumber) {
+        this.browserPages.add(pageNumber);
+    }
+
+    hasBrowserPage(pageNumber) {
+        return this.browserPages.has(pageNumber);
+    }
+}
+
+const classifyResponse = (status, wafAction, text) => {
+    if (status === 200) return 'ok';
+    if (status === 299) return 'session';
+    if (wafAction === 'challenge' || status === 202 || status === 401 || status === 403) return 'session';
+    if (status === 429) return /LOGIN_REQUIRED/i.test(text) || !text.trim() ? 'session' : 'transient';
+    if (status >= 500) return 'transient';
+    return 'fatal';
+};
+
+const requestPage = async ({ state, query, pageNumber }) => {
+    const profile = IMPIT_PROFILES[state.profileIndex % IMPIT_PROFILES.length];
+    const clientKey = `${profile}::${state.proxyUrl || ''}`;
+    if (!state.clients.has(clientKey)) state.clients.set(clientKey, createClient(profile, state.proxyUrl));
+    const client = state.clients.get(clientKey);
+
+    const response = await client.fetch(state.session.endpoint, {
+        method: 'POST',
+        headers: { ...state.session.headers, 'content-type': 'application/json' },
+        body: JSON.stringify(buildRequestBody({ session: state.session, query, pageNumber })),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    const text = await response.text();
+    const wafAction = (response.headers.get('x-amzn-waf-action') || '').toLowerCase();
+    const kind = classifyResponse(response.status, wafAction, text);
+
+    if (kind !== 'ok') {
+        log.debug(`Page ${pageNumber} via ${profile}: HTTP ${response.status} (${kind}).`);
+        return { kind, status: response.status };
+    }
+
+    const payload = parseJson(text);
+    if (!payload || typeof payload !== 'object') {
+        return { kind: 'transient', status: response.status, reason: 'invalid_json' };
+    }
+    if (payload.error_code) {
+        log.debug(`Page ${pageNumber} returned error_code ${payload.error_code}.`);
+        return { kind: 'session', status: response.status };
+    }
+    if (!Array.isArray(payload.layout)) {
+        log.warning(`Page ${pageNumber} returned a payload without a layout array.`);
+        return { kind: 'fatal', status: response.status, reason: 'unexpected_payload' };
+    }
+
+    return { kind: 'ok', status: response.status, payload };
+};
+
+const refreshSession = async ({ state, searchUrl, query }) => {
+    log.warning('Search session was rejected; starting a fresh browser session.');
+    const preferred = state.session?.variant === 'lite' ? ['lite', 'desktop'] : SESSION_VARIANTS;
+    const session = await setupSessionWithRetry({ searchUrl, query, proxyUrl: state.proxyUrl, variants: preferred });
+    await closeSession(state.session);
+    state.replaceSession(session);
+    log.info(`Fresh session ready via the ${session.variant} storefront (store: ${session.storeId || 'unknown'}).`);
+    return session;
+};
+
+const emitProducts = async ({ state, payload, pageNumber, query }) => {
+    const products = extractProducts(payload);
+    const output = [];
+
+    for (const item of products) {
+        if (state.totalSaved + output.length >= state.resultsWanted) break;
+
+        const id = productId(item);
+        if (!id || state.hasSeen(id)) continue;
+
+        const mapped = mapProductItem({ item, searchQuery: query, pageNumber });
+        if (Object.keys(mapped).length === 0) continue;
+
+        state.markSeen(id);
+        output.push(mapped);
+    }
+
+    if (output.length === 0) return 0;
+
+    await Actor.pushData(output);
+    state.addSaved(output.length);
+    log.info(
+        `Saved ${output.length} product(s) from page ${pageNumber}. Total: ${state.totalSaved}/${state.resultsWanted}.`,
+    );
+    return output.length;
+};
+
+const fetchPageWithRecovery = async ({ state, query, pageNumber, searchUrl }) => {
+    let transientAttempts = 0;
+    let refreshes = 0;
+    let lastKind = 'exhausted';
+
+    while (transientAttempts < MAX_PAGE_ATTEMPTS && refreshes <= MAX_SESSION_REFRESHES) {
+        try {
+            const result = await requestPage({ state, query, pageNumber });
+
+            if (result.kind === 'ok') return result;
+
+            if (result.kind === 'session') {
+                lastKind = 'blocked';
+                if (refreshes >= MAX_SESSION_REFRESHES) return result;
+                refreshes++;
+                log.warning(
+                    `Page ${pageNumber} rejected (HTTP ${result.status}); refreshing session (${refreshes}/${MAX_SESSION_REFRESHES}).`,
+                );
+                await refreshSession({ state, searchUrl, query });
+                continue;
+            }
+
+            if (result.kind === 'transient') {
+                transientAttempts++;
+                state.rotateProfile();
+                lastKind = 'transient';
+                if (transientAttempts >= MAX_PAGE_ATTEMPTS) break;
+                log.warning(
+                    `Temporary failure on page ${pageNumber} (attempt ${transientAttempts}/${MAX_PAGE_ATTEMPTS}); switching profile.`,
+                );
+                await sleep(backoffDelay(transientAttempts));
+                continue;
+            }
+
+            return result;
+        } catch (error) {
+            transientAttempts++;
+            state.rotateProfile();
+            lastKind = 'transient';
+            if (transientAttempts >= MAX_PAGE_ATTEMPTS) return { kind: 'exhausted', error };
+            log.warning(
+                `Request error on page ${pageNumber} (attempt ${transientAttempts}/${MAX_PAGE_ATTEMPTS}): ${shortError(error)}`,
+            );
+            await sleep(backoffDelay(transientAttempts));
+        }
+    }
+
+    return { kind: lastKind };
+};
+
+const collectViaBrowser = async ({ state, query, maxPages }) => {
+    const { session } = state;
+    if (!session?.page) return { emitted: 0, reachedEnd: false };
+
+    let cursor = session.captures.length;
+    let emitted = 0;
+    let emptyScrolls = 0;
+    let reachedEnd = false;
+
+    for (let step = 0; step < MAX_SCROLL_STEPS; step++) {
+        if (state.totalSaved >= state.resultsWanted || state.pagesProcessed >= maxPages) break;
+
+        await session.page.mouse.wheel(0, 2400).catch(() => {});
+        await session.page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5)).catch(() => {});
+        await sleep(SCROLL_WAIT_MS);
+
+        const fresh = session.captures.slice(cursor);
+        cursor = session.captures.length;
+        let produced = 0;
+
+        for (const capture of fresh) {
+            if (capture.status !== 200 || !Array.isArray(capture.payload?.layout)) continue;
+            if (state.totalSaved >= state.resultsWanted || state.pagesProcessed >= maxPages) break;
+
+            const currentPage = Number(capture.payload?.currentPage);
+            const pageNumber = Number.isFinite(currentPage) ? currentPage : state.pagesProcessed;
+            if (state.hasBrowserPage(pageNumber)) continue;
+            state.markBrowserPage(pageNumber);
+
+            const saved = await emitProducts({
+                state,
+                payload: capture.payload,
+                pageNumber,
+                query,
+            });
+            produced += saved;
+            state.recordPage();
+            if (capture.payload?.hasReachedEnd) reachedEnd = true;
+        }
+
+        emitted += produced;
+        if (reachedEnd) break;
+
+        if (produced === 0) {
+            emptyScrolls++;
+            if (emptyScrolls >= MAX_EMPTY_SCROLLS) break;
+        } else {
+            emptyScrolls = 0;
+        }
+    }
+
+    return { emitted, reachedEnd };
+};
+
+const resolveProxyUrl = async (proxyConfig) => {
+    const shouldUseApifyProxy = Boolean(proxyConfig?.useApifyProxy);
+    const hasCustomUrls = Array.isArray(proxyConfig?.proxyUrls) && proxyConfig.proxyUrls.length > 0;
+    if (!shouldUseApifyProxy && !hasCustomUrls) return undefined;
+
+    const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
+    return proxyConfiguration ? proxyConfiguration.newUrl() : undefined;
 };
 
 await Actor.init();
 
 let exitCode = 0;
+let runState;
 
 try {
     const input = (await Actor.getInput()) || {};
@@ -455,99 +842,104 @@ try {
         proxyConfiguration: proxyConfig,
     } = input;
 
-    const resultsWanted = parsePositiveInt(resultsWantedInput, 20);
-    const maxPages = parsePositiveInt(maxPagesInput, 5);
+    const resultsWanted = parsePositiveInt(resultsWantedInput, DEFAULT_RESULTS_WANTED);
+    const maxPages = parsePositiveInt(maxPagesInput, DEFAULT_MAX_PAGES);
+    const { searchQuery, searchUrl } = resolveSearchContext({ query, startUrl });
+    const proxyUrl = await resolveProxyUrl(proxyConfig);
 
-    const searchContext = resolveSearchContext({ query, startUrl });
-    if (!searchContext) {
-        throw new Error('Missing search input. Provide `query` or a `startUrl` containing a `query` parameter.');
-    }
+    log.info(
+        `Start run | query="${searchQuery}" | results=${resultsWanted} | max_pages=${maxPages} | proxy=${proxyUrl ? 'on' : 'off'}`,
+    );
 
-    const { searchQuery, searchUrl } = searchContext;
+    const state = new RunState({ proxyUrl, resultsWanted });
 
-    const proxyConfiguration = proxyConfig ? await Actor.createProxyConfiguration(proxyConfig) : undefined;
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+    state.session = await setupSessionWithRetry({ searchUrl, query: searchQuery, proxyUrl });
+    runState = state;
+    log.info(
+        `Search session ready via the ${state.session.variant} storefront (page 0: ${state.session.productCount} product(s), store: ${state.session.storeId || 'unknown'}).`,
+    );
 
-    const client = new Impit({
-        browser: IMPIT_BROWSER,
-        ...(proxyUrl ? { proxyUrl } : {}),
-    });
-
-    let session = await captureSessionWithRetry({ searchUrl, proxyUrl });
-    log.info(`Search session ready for "${searchQuery}" (page 0: ${session.firstPageProductCount} product(s)).`);
-
-    const seenIds = new Set();
-    let totalSaved = 0;
-    let pagesProcessed = 0;
     let stopReason = 'completed';
 
-    const emitPage = async ({ payload, pageNumber }) => {
-        const products = extractProductItems(payload);
-        const output = [];
+    await emitProducts({
+        state,
+        payload: state.session.payload,
+        pageNumber: state.session.pageNumber,
+        query: searchQuery,
+    });
+    state.pagesProcessed = 1;
 
-        for (const item of products) {
-            const uniqueId = item?.id || item?.objectId || item?.productVariant?.id || item?.product?.id;
-            if (!uniqueId || seenIds.has(uniqueId)) continue;
+    let reachedEnd = Boolean(state.session.payload?.hasReachedEnd);
+    const firstNext = Number(state.session.payload?.nextPageParams?.pageNumber);
+    let nextPage = Number.isFinite(firstNext) ? firstNext : state.session.pageNumber + 1;
+    let useBrowser = false;
+    let emptyPages = 0;
 
-            const mappedItem = mapProductItem({ item, searchQuery, pageNumber });
-            if (Object.keys(mappedItem).length === 0) continue;
+    while (state.totalSaved < resultsWanted && state.pagesProcessed < maxPages && !reachedEnd) {
+        if (!useBrowser) {
+            const result = await fetchPageWithRecovery({ state, query: searchQuery, pageNumber: nextPage, searchUrl });
 
-            seenIds.add(uniqueId);
-            output.push(mappedItem);
+            if (result.kind !== 'ok') {
+                log.warning(
+                    `Structured request path unavailable (${result.kind}); continuing with browser pagination.`,
+                );
+                stopReason = 'browser_fallback';
+                useBrowser = true;
+                continue;
+            }
 
-            if (totalSaved + output.length >= resultsWanted) break;
+            const saved = await emitProducts({
+                state,
+                payload: result.payload,
+                pageNumber: nextPage,
+                query: searchQuery,
+            });
+            state.pagesProcessed++;
+            reachedEnd = Boolean(result.payload?.hasReachedEnd);
+
+            const candidate = Number(result.payload?.nextPageParams?.pageNumber);
+            nextPage = Number.isFinite(candidate) ? candidate : nextPage + 1;
+
+            if (saved === 0) {
+                emptyPages++;
+                if (emptyPages >= 2) {
+                    stopReason = 'no_new_products';
+                    break;
+                }
+            } else {
+                emptyPages = 0;
+            }
+            continue;
         }
 
-        if (output.length > 0) {
-            await Actor.pushData(output);
-            totalSaved += output.length;
-            log.info(`Saved ${output.length} product(s) from page ${pageNumber}. Total: ${totalSaved}/${resultsWanted}.`);
-        }
-
-        return output.length;
-    };
-
-    await emitPage({ payload: session.firstPagePayload, pageNumber: session.firstPageNumber });
-    pagesProcessed++;
-
-    let nextPage = session.firstPageNumber + 1;
-    let hasReachedEnd = Boolean(session.firstPagePayload?.hasReachedEnd);
-
-    while (totalSaved < resultsWanted && pagesProcessed < maxPages && !hasReachedEnd) {
-        const result = await fetchPageWithRecovery({
-            client,
+        const { emitted, reachedEnd: browserEnd } = await collectViaBrowser({
+            state,
             query: searchQuery,
-            pageNumber: nextPage,
-            searchUrl,
-            proxyUrl,
-            session,
+            maxPages,
         });
 
-        session = result.session;
-
-        const pagePayload = result.payload;
-        if (!pagePayload) {
-            stopReason = `page_${nextPage}_unavailable`;
-            break;
-        }
-
-        const savedNow = await emitPage({ payload: pagePayload, pageNumber: nextPage });
-        pagesProcessed++;
-        hasReachedEnd = Boolean(pagePayload?.hasReachedEnd);
-
-        if (savedNow === 0 && hasReachedEnd) break;
-        nextPage++;
+        if (browserEnd) reachedEnd = true;
+        if (emitted === 0) stopReason = 'browser_fallback_empty';
+        break;
     }
 
-    if (totalSaved === 0) {
-        throw new Error('Run completed but no products were extracted.');
+    if (reachedEnd) stopReason = 'end_of_results';
+
+    if (state.totalSaved === 0) {
+        throw new Error(
+            'Run finished without any products. The query may have no results, or Zepto returned no serviceable store.',
+        );
     }
 
-    log.info(`Done | query="${searchQuery}" | saved=${totalSaved} | pages=${pagesProcessed} | stop_reason=${stopReason}`);
+    log.info(
+        `Done | query="${searchQuery}" | saved=${state.totalSaved} | pages=${state.pagesProcessed} | stop_reason=${stopReason}`,
+    );
 } catch (error) {
     exitCode = 1;
-    const safeMessage = String(error?.message || 'Unknown error').replace(/https?:\/\/\S+/gi, '[redacted]');
+    const safeMessage = shortError(error).replace(/https?:\/\/\S+/gi, '[redacted]');
     log.error(`Actor failed: ${safeMessage}`);
+} finally {
+    if (runState?.session) await closeSession(runState.session);
 }
 
 await Actor.exit({ exitCode });
