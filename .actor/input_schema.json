@@ -37,7 +37,7 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Route requests through Apify Proxy. An Indian residential proxy also changes the delivery store used for prices and stock.",
+      "description": "Route requests through Apify Proxy. An Indian residential proxy changes the delivery store used for prices and stock. Datacenter proxy IPs are often blocked by Zepto; use residential when a run is login-walled.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": false

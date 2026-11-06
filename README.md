@@ -44,12 +44,19 @@ The full output table below lists every field the Actor can save.
 1. Open Zepto Product Scraper on Apify.
 2. Enter a product term in `query`, or paste a public Zepto search URL in `startUrl`.
 3. Set `results_wanted` for the number of rows and `max_pages` as a pagination cap.
-4. Enable `proxyConfiguration` only if the run needs Apify Proxy.
+4. Leave `proxyConfiguration` off unless you need a specific exit IP. Residential IN is the reliable choice for Zepto; datacenter IPs are often blocked.
 5. Start the run and open the dataset preview.
 6. Download the results or connect the dataset to your next workflow.
 
 If both search fields are filled, `query` wins and `startUrl` is ignored. If neither is filled, the
 Actor runs the default search URL. A `startUrl` must contain a `query` parameter.
+
+Zepto resolves the delivery store from the request IP. If no store is serviceable, the Actor retries
+with a Bengaluru delivery location so the run can still return products. If the exit IP is
+login-walled and you did not configure a proxy, the Actor retries the session once with an Apify
+Indian residential proxy. A proxy that you configure yourself is used as-is; datacenter proxy IPs are
+often blocked, so residential is the reliable choice. The `store_id` field records which store
+supplied each row.
 
 ## Input Parameters
 
@@ -59,7 +66,7 @@ Actor runs the default search URL. A `startUrl` must contain a `query` parameter
 | `startUrl` | String | No | `https://www.zepto.com/search?query=Chocolate` | Public Zepto search URL. Its `query` parameter is used when `query` is empty. |
 | `results_wanted` | Integer | No | `20` | Maximum number of unique products to save. Minimum `1`. |
 | `max_pages` | Integer | No | `5` | Maximum number of result pages to read. Minimum `1`. |
-| `proxyConfiguration` | Object | No | `{"useApifyProxy": false}` | Optional Apify Proxy configuration. |
+| `proxyConfiguration` | Object | No | `{"useApifyProxy": false}` | Optional proxy. Residential IN is the reliable choice; datacenter IPs are often blocked. |
 
 ## Output Data
 
@@ -202,8 +209,10 @@ This is a real row from a `Chocolate` run. Values differ by product and store.
 - If the normal request path is rejected, the Actor reads the rendered results page and keeps going.
   Data already saved stays in the dataset.
 - A rejected session is rebuilt and the page is retried before the fallback is used.
+- If the main search endpoint rejects a page, the Actor retries it through the older v3 endpoint.
 - If the main storefront asks for a login, the Actor switches to Zepto's lighter storefront and
-  continues.
+  continues. If both storefronts refuse and no proxy was configured, it retries once with an Apify
+  Indian residential proxy.
 
 ## Tips for best results
 
@@ -226,8 +235,9 @@ This is a real row from a `Chocolate` run. Values differ by product and store.
   different prices for the same product. `store_id` shows which store was used.
 - Result counts depend on the query. A run can stop at `results_wanted`, `max_pages`, the end of the
   results, or a session failure, so fewer rows may be returned.
-- Zepto may ask an IP to log in before searching. The Actor tries the lighter storefront in that
-  case. If both storefronts refuse, enable an Indian residential proxy and retry.
+- Zepto may ask an IP to log in before searching. The Actor tries the older v3 search endpoint, the
+  lighter storefront, and, when no proxy is configured, an Apify Indian residential proxy. If a
+  proxy you configured is blocked, switch it to residential; datacenter IPs are often rejected.
 - Prices are in INR and change between runs.
 
 ## Integrations and export formats
